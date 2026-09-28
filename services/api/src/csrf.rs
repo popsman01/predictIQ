@@ -157,3 +157,156 @@ pub async fn csrf_protection_middleware(
     // Non-browser / API client (no Origin, no Cookie) — pass through.
     Ok(next.run(request).await)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::Body;
+    use axum::http::Request as HttpRequest;
+    use axum::routing::post;
+    use axum::Router;
+    use tower::ServiceExt;
+
+    fn test_config() -> Arc<CsrfConfig> {
+        Arc::new(CsrfConfig {
+            allowed_origins: vec![
+                "https://app.predictiq.com".to_string(),
+                "https://staging.predictiq.com".to_string(),
+            ],
+        })
+    }
+
+    /// Build a router with the CSRF middleware applied to a state-changing route.
+    fn app() -> Router {
+        Router::new()
+            .route("/mutate", post(|| async { StatusCode::OK }))
+            .route("/read", axum::routing::get(|| async { StatusCode::OK }))
+            .layer(axum::middleware::from_fn_with_state(
+                test_config(),
+                csrf_protection_middleware,
+            ))
+    }
+
+    async fn send(method: &str, path: &str, headers: &[(&str, &str)]) -> StatusCode {
+        let mut builder = HttpRequest::builder().method(method).uri(path);
+        for (name, value) in headers {
+            builder = builder.header(*name, *value);
+        }
+        let request = builder.body(Body::empty()).unwrap();
+        app().oneshot(request).await.unwrap().status()
+    }
+
+    #[tokio::test]
+    async fn matching_allowed_origin_passes() {
+        let status = send(
+            "POST",
+            "/mutate",
+            &[("origin", "https://app.predictiq.com")],
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn matching_allowed_origin_is_case_insensitive() {
+        let status = send(
+            "POST",
+            "/mutate",
+            &[("origin", "https://APP.PredictIQ.com")],
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn mismatched_origin_is_rejected() {
+        let status = send(
+            "POST",
+            "/mutate",
+            &[("origin", "https://evil.example.com")],
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn origin_prefix_lookalike_is_rejected() {
+        // A host that merely starts with an allowed origin string must not pass.
+        let status = send(
+            "POST",
+            "/mutate",
+            &[("origin", "https://app.predictiq.com.evil.example.com")],
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn missing_origin_and_referer_without_cookie_passes() {
+        // Non-browser / API client: no Origin, no Cookie → allowed through.
+        let status = send("POST", "/mutate", &[]).await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn missing_origin_with_cookie_and_no_referer_passes() {
+        // Documented policy: Referer absent → pass through.
+        let status = send("POST", "/mutate", &[("cookie", "session=abc")]).await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn missing_origin_with_cookie_and_matching_referer_passes() {
+        let status = send(
+            "POST",
+            "/mutate",
+            &[
+                ("cookie", "session=abc"),
+                ("referer", "https://app.predictiq.com/newsletter"),
+            ],
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn missing_origin_with_cookie_and_mismatched_referer_is_rejected() {
+        let status = send(
+            "POST",
+            "/mutate",
+            &[
+                ("cookie", "session=abc"),
+                ("referer", "https://evil.example.com/newsletter"),
+            ],
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn api_key_short_circuits_mismatched_origin() {
+        // X-Api-Key requests bypass CSRF even with a hostile Origin.
+        let status = send(
+            "POST",
+            "/mutate",
+            &[
+                ("x-api-key", "secret"),
+                ("origin", "https://evil.example.com"),
+            ],
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn safe_method_with_mismatched_origin_passes() {
+        // GET is not state-changing → middleware skips the check.
+        let status = send(
+            "GET",
+            "/read",
+            &[("origin", "https://evil.example.com")],
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+    }
+}
